@@ -1,0 +1,10 @@
+streamlit
+requests
+folium
+polyline
+streamlit-folium
+pandas
+Pillow
+geopy
+scikit-learn
+streamlit-card
