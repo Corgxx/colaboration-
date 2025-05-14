@@ -15,9 +15,10 @@ from datetime import datetime
 import numpy as np
 from streamlit_card import card
 from geopy.geocoders import Nominatim
-import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import pickle
+from geopy.distance import geodesic
+from pyproj import Transformer
 
 # Set page configuration
 st.set_page_config(
@@ -57,22 +58,254 @@ def extract_features(activity):
     if activity_type in ['Hiking', 'Cycling']:
         # Outdoor activity features
         features = [
-            activity.get('distance_km', 0),
-            activity.get('estimated_time_min', 0),
+            activity.get('distance_km', 0) or 0,  # Default to 0 if None
+            activity.get('estimated_time_min', 0) or 0,  # Default to 0 if None
             # Convert difficulty to numeric value
             {'Easy': 1, 'Moderate': 2, 'Hard': 3}.get(activity.get('difficulty', 'Easy'), 1),
-            activity.get('elevation_gain', 0)
+            activity.get('elevation_gain', 0) or 0  # Default to 0 if None
         ]
     else:
         # Business activity features
         features = [
-            activity.get('rating', 3.0),  # Default to 3.0 if not available
+            activity.get('rating', 3.0) or 3.0,  # Default to 3.0 if None
             len(activity.get('categories', [])),  # Number of categories
             {'$': 1, '$$': 2, '$$$': 3, '$$$$': 4}.get(activity.get('price', '$$'), 2),  # Price level
             activity.get('review_count', 0) / 100 if activity.get('review_count') else 0  # Normalized review count
         ]
         
     return np.array(features).reshape(1, -1)
+
+# Function to fetch official hiking or cycling routes from SwissTopo API
+def display_activity_card():
+    if not st.session_state.current_activities or st.session_state.current_index >= len(st.session_state.current_activities):
+        st.info("No more activities to show. Try changing your filters or location!")
+        return
+    if st.session_state.recommendation_model:
+        st.markdown("✨ **Recommendations personalized based on your likes**")
+    
+    activity = st.session_state.current_activities[st.session_state.current_index]
+    
+    # Container for the card
+    with st.container():
+        # Display the image carousel or map
+        col1, col2, col3 = st.columns([1, 4, 1])
+        
+        with col1:
+            # Previous image button
+            if st.button("◀️", key="prev_img"):
+                if 'photos' in activity and len(activity['photos']) > 1:
+                    st.session_state.image_index = (st.session_state.image_index - 1) % len(activity['photos'])
+        
+        with col2:
+            activity_type = activity.get('type', 'Business')
+            
+            if activity_type in ['Hiking', 'Cycling']:
+                # Display route map
+                if 'coordinates' in activity:
+                    m = create_route_map(activity['coordinates'])
+                    folium_static(m, width=600, height=400)
+            else:
+                # Display business image
+                image_url = activity.get('image_url')
+                if image_url:
+                    st.image(image_url, use_column_width=True)
+                else:
+                    st.image("https://via.placeholder.com/600x400?text=No+Image+Available", use_column_width=True)
+        
+        with col3:
+            # Next image button
+            if st.button("▶️", key="next_img"):
+                if 'photos' in activity and len(activity['photos']) > 1:
+                    st.session_state.image_index = (st.session_state.image_index + 1) % len(activity['photos'])
+        
+        # Activity info box
+        st.subheader(activity.get('name', 'Unnamed Activity'))
+        
+        col1, col2 = st.columns(2)
+        
+    with col1:
+        if activity_type in ['Hiking', 'Cycling']:
+            st.write(f"**Type:** {activity_type}")
+            st.write(f"**Distance:** {activity.get('distance_km', 0) or 0.0:.1f} km")
+            st.write(f"**Est. Time:** {float(activity.get('estimated_time_min', 0) if activity.get('estimated_time_min', 0) != 'N/A' else 0):.0f} min")
+            st.write(f"**Difficulty:** {activity.get('difficulty', 'N/A')}")
+            st.write(f"**Elevation Gain:** {activity.get('elevation_gain', 0) or 0} m")
+        else:
+                if 'location' in activity and 'display_address' in activity['location']:
+                    address = ", ".join(activity['location']['display_address'])
+                    st.write(f"**Address:** {address}")
+                
+                rating = activity.get('rating', 'N/A')
+                if rating != 'N/A':
+                    stars = "⭐" * int(rating) + ("½" if rating % 1 >= 0.5 else "")
+                    st.write(f"**Rating:** {rating} {stars}")
+                
+                price = activity.get('price', 'N/A')
+                st.write(f"**Price:** {price}")
+                
+                if 'distance' in activity:
+                    distance_km = activity['distance'] / 1000
+                    st.write(f"**Distance:** {distance_km:.1f} km")
+        
+        with col2:
+            if activity_type not in ['Hiking', 'Cycling']:
+                if 'categories' in activity:
+                    categories = ", ".join([cat['title'] for cat in activity['categories']])
+                    st.write(f"**Categories:** {categories}")
+                
+                if 'display_phone' in activity:
+                    st.write(f"**Phone:** {activity['display_phone']}")
+                
+                if 'url' in activity:
+                    st.write(f"[View on Yelp]({activity['url']})")
+        
+        # Action buttons
+        col1, col2, col3 = st.columns([1, 1, 1])
+        
+        with col1:
+            if st.button("👎 Pass", key="pass_btn", use_container_width=True):
+                pass_activity()
+                st.rerun()
+        
+        with col3:
+            if st.button("👍 Like", key="like_btn", use_container_width=True):
+                like_activity()
+                st.rerun()
+
+# Define transformers for WGS84 <-> LV95
+wgs84_to_lv95_transformer = Transformer.from_crs("EPSG:4326", "EPSG:2056", always_xy=True)
+lv95_to_wgs84_transformer = Transformer.from_crs("EPSG:2056", "EPSG:4326", always_xy=True)
+
+# Coordinate Conversion Functions
+def wgs84_to_lv95(lat, lon):
+    """Convert WGS84 (latitude, longitude) to LV95 (Swiss coordinate system)."""
+    x, y = wgs84_to_lv95_transformer.transform(lon, lat)  # Note: always_xy=True ensures (lon, lat) order
+    return x, y
+
+def lv95_to_wgs84(x, y):
+    """Convert LV95 (Swiss coordinate system) to WGS84 (latitude, longitude)."""
+    lon, lat = lv95_to_wgs84_transformer.transform(x, y)  # Note: always_xy=True ensures (x, y) order
+    return lat, lon
+
+def validate_coordinates(coords):
+    """
+    Validate that the coordinates are within valid ranges.
+    Args:
+        coords (tuple): A tuple of (latitude, longitude).
+    Raises:
+        ValueError: If the coordinates are invalid.
+    """
+    lat, lon = coords
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError(f"Invalid coordinates: {coords}")
+
+# Function to Fetch Routes from SwissTopo API
+def fetch_swisstopo_routes(lat, lon, radius_km, layer):
+    """
+    Fetch official hiking or cycling routes from SwissTopo API and filter by radius.
+    """
+    print(f"Input WGS84: lat={lat}, lon={lon}, radius_km={radius_km}")
+    center_x, center_y = wgs84_to_lv95(lat, lon)
+    print(f"Converted to LV95: x={center_x}, y={center_y}")
+
+    # Convert radius to meters for bounding box calculation
+    radius_m = radius_km * 1000
+    delta = radius_m
+
+    # Define bounding box (xmin, ymin, xmax, ymax)
+    xmin = center_x - delta
+    ymin = center_y - delta
+    xmax = center_x + delta
+    ymax = center_y + delta
+    print(f"Bounding Box (LV95): xmin={xmin}, ymin={ymin}, xmax={xmax}, ymax={ymax}")
+
+    # Convert bounding box to WGS84 for verification
+    xmin_wgs84, ymin_wgs84 = lv95_to_wgs84(xmin, ymin)
+    xmax_wgs84, ymax_wgs84 = lv95_to_wgs84(xmax, ymax)
+    print(f"Bounding Box (WGS84): SW=({ymin_wgs84}, {xmin_wgs84}), NE=({ymax_wgs84}, {xmax_wgs84})")
+
+    # SwissTopo API URL
+    url = (
+        f"https://api3.geo.admin.ch/rest/services/all/MapServer/identify?"
+        f"geometryType=esriGeometryEnvelope"
+        f"&geometry={xmin},{ymin},{xmax},{ymax}"
+        f"&layers=all:{layer}"
+        f"&tolerance=0"
+        f"&mapExtent={xmin},{ymin},{xmax},{ymax}"
+        f"&imageDisplay=800,600,96"
+        f"&returnGeometry=true"
+        f"&sr=2056"
+    )
+
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+
+            # Add this line to inspect the full API response
+            print(json.dumps(data, indent=4))
+
+            routes = []
+
+            # Parse the response to extract route details
+            for feature in data.get("results", []):
+                if "geometry" in feature and "paths" in feature["geometry"]:
+                    for path in feature["geometry"]["paths"]:
+                        # Convert LV95 coordinates back to WGS84
+                        coordinates = [lv95_to_wgs84(x, y) for x, y in path]
+                        print(f"Route Coordinates (WGS84): {coordinates[:5]}...")  # Debugging
+
+                        # Validate coordinates
+                        if len(coordinates) < 2:
+                            print("Skipping short path.")
+                            continue
+
+                        # Calculate total distance
+                        total_distance_km = sum(
+                            geodesic(coordinates[i], coordinates[i + 1]).kilometers
+                            for i in range(len(coordinates) - 1)
+                        )
+                        if total_distance_km < 4:  # Exclude paths shorter than 4 km
+                            print(f"Skipping route with distance {total_distance_km:.2f} km (too short).")
+                            continue
+
+                        # Filter by route type
+                        route_type = feature.get("attributes", {}).get("type", "Unknown")
+                        print(f"Route Type: {route_type}")  # Debugging
+
+                        if route_type == "Unknown":
+                            print("Route type is unknown. Assuming it's a hiking route.")
+                        elif route_type not in ["Hiking", "Trail"]:
+                            print(f"Skipping non-hiking route: {route_type}")
+                            continue
+
+                        # Append the route details
+                        routes.append({
+                            "name": feature.get("attributes", {}).get("name", "Unnamed Route"),
+                            "coordinates": coordinates,
+                            "type": "Hiking" if layer == "ch.swisstopo.swisstlm3d-wanderwege" else "Cycling",
+                            "distance_km": total_distance_km,
+                            "difficulty": feature.get("attributes", {}).get("difficulty", "N/A"),
+                            "elevation_gain": feature.get("attributes", {}).get("elevation_gain", 0),
+                            "image_url": None  # Placeholder for now
+                        })
+            return routes
+        else:
+            st.error(f"SwissTopo API error: {response.status_code} - {response.text}")
+            return []
+    except Exception as e:
+        st.error(f"Error fetching routes from SwissTopo API: {e}")
+        return None
+
+# Fetch Hiking and Cycling Routes
+def fetch_hiking_routes(lat, lon, radius_km=10):
+    """Fetch official hiking routes using SwissTopo API."""
+    return fetch_swisstopo_routes(lat, lon, radius_km, layer="ch.swisstopo.swisstlm3d-wanderwege")
+
+def fetch_cycling_routes(lat, lon, radius_km=10):
+    """Fetch official cycling routes using SwissTopo API."""
+    return fetch_swisstopo_routes(lat, lon, radius_km, layer="ch.astra.veloland")
+
 # Function to save user preferences to user profile
 def save_to_user_profile(activity):
     """Save liked activity and update user preferences"""
@@ -106,7 +339,7 @@ def save_to_user_profile(activity):
         st.session_state.user_profile['preferences']['difficulty'][difficulty] += 1
         
         # Track preferred distance range
-        distance = activity.get('distance_km', 0)
+        distance = activity.get('distance_km', 0) or 0  # Default to 0 if None
         if 'distance_ranges' not in st.session_state.user_profile['preferences']:
             st.session_state.user_profile['preferences']['distance_ranges'] = {'short': 0, 'medium': 0, 'long': 0}
         if distance < 5:
@@ -156,6 +389,8 @@ def train_recommendation_model():
     # Train outdoor activity model if enough data
     if len(outdoor_activities) >= 3:
         features = np.array([a['features'] for a in outdoor_activities])
+        # Replace NaN values with 0
+        features = np.nan_to_num(features, nan=0.0)
         model = NearestNeighbors(n_neighbors=min(3, len(outdoor_activities)), algorithm='ball_tree')
         model.fit(features)
         models['outdoor'] = model
@@ -163,6 +398,8 @@ def train_recommendation_model():
     # Train business activity model if enough data
     if len(business_activities) >= 3:
         features = np.array([a['features'] for a in business_activities])
+        # Replace NaN values with 0
+        features = np.nan_to_num(features, nan=0.0)
         model = NearestNeighbors(n_neighbors=min(3, len(business_activities)), algorithm='ball_tree')
         model.fit(features)
         models['business'] = model
@@ -186,7 +423,10 @@ def get_personalized_recommendations(activities):
     # Extract features for all activities
     features_list = []
     for activity in activities:
-        features_list.append(extract_features(activity)[0])
+        features = extract_features(activity)[0]
+        # Replace NaN values with 0
+        features = np.nan_to_num(features, nan=0.0)
+        features_list.append(features)
     
     features_array = np.array(features_list)
     
@@ -204,6 +444,7 @@ def get_personalized_recommendations(activities):
     sorted_activities = [activities[i] for i in sorted_indices]
     
     return sorted_activities
+
 # Function to get coordinates from location name
 def get_coordinates(location_name):
     try:
@@ -261,91 +502,6 @@ def fetch_yelp_activities(latitude, longitude, category, radius=10000, limit=20)
     except Exception as e:
         st.error(f"Exception when calling Yelp API: {e}")
         return []
-# Function to fetch hiking trails
-def fetch_hiking_routes(latitude, longitude, radius=10000):
-    # Original code to fetch/generate hiking routes
-    sample_routes = []
-    
-    # Create 5 sample routes
-    for i in range(5):
-        # Generate start point with slight offset from provided coordinates
-        start_lat = latitude + (random.random() - 0.5) * 0.05
-        start_lon = longitude + (random.random() - 0.5) * 0.05
-        
-        # Generate end point
-        end_lat = start_lat + (random.random() - 0.5) * 0.02
-        end_lon = start_lon + (random.random() - 0.5) * 0.02
-        
-        # Calculate the coordinates for the route (simplified as a straight line for demo)
-        num_points = 10
-        route_coordinates = []
-        for j in range(num_points):
-            point_lat = start_lat + (end_lat - start_lat) * j / (num_points - 1)
-            point_lon = start_lon + (end_lon - start_lon) * j / (num_points - 1)
-            route_coordinates.append([point_lat, point_lon])
-        
-        # Calculate estimated distance and time
-        distance_km = round(random.uniform(2, 15), 1)  # Random distance between 2 and 15 km
-        estimated_time = round(distance_km / 4 * 60)  # Assuming 4 km/h average speed
-        
-        # Create route object
-        route = {
-            "id": f"hiking_{i}",
-            "name": f"Hiking Trail {i+1}",
-            "coordinates": route_coordinates,
-            "distance_km": distance_km,
-            "estimated_time_min": estimated_time,
-            "difficulty": random.choice(["Easy", "Moderate", "Hard"]),
-            "elevation_gain": round(random.uniform(50, 500)),  # Random elevation gain in meters
-            "type": "Hiking",
-            "image_url": None  # We'll generate this from the map
-        }
-        
-        sample_routes.append(route)
-    
-    # Apply personalized recommendations if model exists
-    if st.session_state.recommendation_model:
-        sample_routes = get_personalized_recommendations(sample_routes)
-    
-    return sample_routes
-
-# Function to fetch cycling routes
-def fetch_cycling_routes(latitude, longitude, radius=10000):
-    # Similar to hiking, but with longer routes and faster expected speeds
-    sample_routes = []
-    
-    for i in range(5):
-        start_lat = latitude + (random.random() - 0.5) * 0.05
-        start_lon = longitude + (random.random() - 0.5) * 0.05
-        
-        end_lat = start_lat + (random.random() - 0.5) * 0.04
-        end_lon = start_lon + (random.random() - 0.5) * 0.04
-        
-        num_points = 15
-        route_coordinates = []
-        for j in range(num_points):
-            point_lat = start_lat + (end_lat - start_lat) * j / (num_points - 1)
-            point_lon = start_lon + (end_lon - start_lon) * j / (num_points - 1)
-            route_coordinates.append([point_lat, point_lon])
-        
-        distance_km = round(random.uniform(5, 30), 1)  # Cycling routes are typically longer
-        estimated_time = round(distance_km / 15 * 60)  # Assuming 15 km/h average speed
-        
-        route = {
-            "id": f"cycling_{i}",
-            "name": f"Cycling Route {i+1}",
-            "coordinates": route_coordinates,
-            "distance_km": distance_km,
-            "estimated_time_min": estimated_time,
-            "difficulty": random.choice(["Easy", "Moderate", "Hard"]),
-            "elevation_gain": round(random.uniform(100, 800)),
-            "type": "Cycling",
-            "image_url": None
-        }
-        
-        sample_routes.append(route)
-    
-    return sample_routes
 
 # Function to get actual routes from OpenRouteService API
 def get_openroute_service_route(start_coords, end_coords, profile='foot-hiking'):
@@ -546,103 +702,6 @@ def restart_app():
     st.session_state.current_activities = []
     st.session_state.image_index = 0
 
-# Function to display current activity card
-def display_activity_card():
-    if not st.session_state.current_activities or st.session_state.current_index >= len(st.session_state.current_activities):
-        st.info("No more activities to show. Try changing your filters or location!")
-        return
-    if st.session_state.recommendation_model:
-        st.markdown("✨ **Recommendations personalized based on your likes**")
-    
-    activity = st.session_state.current_activities[st.session_state.current_index]
-    
-    # Container for the card
-    with st.container():
-        # Display the image carousel or map
-        col1, col2, col3 = st.columns([1, 4, 1])
-        
-        with col1:
-            # Previous image button
-            if st.button("◀️", key="prev_img"):
-                if 'photos' in activity and len(activity['photos']) > 1:
-                    st.session_state.image_index = (st.session_state.image_index - 1) % len(activity['photos'])
-        
-        with col2:
-            activity_type = activity.get('type', 'Business')
-            
-            if activity_type in ['Hiking', 'Cycling']:
-                # Display route map
-                if 'coordinates' in activity:
-                    m = create_route_map(activity['coordinates'])
-                    folium_static(m, width=600, height=400)
-            else:
-                # Display business image
-                image_url = activity.get('image_url')
-                if image_url:
-                    st.image(image_url, use_column_width=True)
-                else:
-                    st.image("https://via.placeholder.com/600x400?text=No+Image+Available", use_column_width=True)
-        
-        with col3:
-            # Next image button
-            if st.button("▶️", key="next_img"):
-                if 'photos' in activity and len(activity['photos']) > 1:
-                    st.session_state.image_index = (st.session_state.image_index + 1) % len(activity['photos'])
-        
-        # Activity info box
-        st.subheader(activity.get('name', 'Unnamed Activity'))
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if activity_type in ['Hiking', 'Cycling']:
-                st.write(f"**Type:** {activity_type}")
-                st.write(f"**Distance:** {activity.get('distance_km', 0):.1f} km")
-                st.write(f"**Est. Time:** {activity.get('estimated_time_min', 0):.0f} min")
-                st.write(f"**Difficulty:** {activity.get('difficulty', 'N/A')}")
-                st.write(f"**Elevation Gain:** {activity.get('elevation_gain', 0)} m")
-            else:
-                if 'location' in activity and 'display_address' in activity['location']:
-                    address = ", ".join(activity['location']['display_address'])
-                    st.write(f"**Address:** {address}")
-                
-                rating = activity.get('rating', 'N/A')
-                if rating != 'N/A':
-                    stars = "⭐" * int(rating) + ("½" if rating % 1 >= 0.5 else "")
-                    st.write(f"**Rating:** {rating} {stars}")
-                
-                price = activity.get('price', 'N/A')
-                st.write(f"**Price:** {price}")
-                
-                if 'distance' in activity:
-                    distance_km = activity['distance'] / 1000
-                    st.write(f"**Distance:** {distance_km:.1f} km")
-        
-        with col2:
-            if activity_type not in ['Hiking', 'Cycling']:
-                if 'categories' in activity:
-                    categories = ", ".join([cat['title'] for cat in activity['categories']])
-                    st.write(f"**Categories:** {categories}")
-                
-                if 'display_phone' in activity:
-                    st.write(f"**Phone:** {activity['display_phone']}")
-                
-                if 'url' in activity:
-                    st.write(f"[View on Yelp]({activity['url']})")
-        
-        # Action buttons
-        col1, col2, col3 = st.columns([1, 1, 1])
-        
-        with col1:
-            if st.button("👎 Pass", key="pass_btn", use_container_width=True):
-                pass_activity()
-                st.rerun()
-        
-        with col3:
-            if st.button("👍 Like", key="like_btn", use_container_width=True):
-                like_activity()
-                st.rerun()
-
 # Function to display liked activities
 def display_liked_activities():
     if not st.session_state.liked_activities:
@@ -675,7 +734,7 @@ def display_liked_activities():
                 if activity_type in ['Hiking', 'Cycling']:
                     st.write(f"**Type:** {activity_type}")
                     st.write(f"**Distance:** {activity.get('distance_km', 0):.1f} km")
-                    st.write(f"**Est. Time:** {activity.get('estimated_time_min', 0):.0f} min")
+                    st.write(f"**Est. Time:** {float(activity.get('estimated_time_min', 0) or 0):.0f} min")
                     st.write(f"**Difficulty:** {activity.get('difficulty', 'N/A')}")
                     st.write(f"**Elevation Gain:** {activity.get('elevation_gain', 0)} m")
                 else:
@@ -700,6 +759,7 @@ def display_liked_activities():
                     
                     if 'url' in activity:
                         st.write(f"[View on Yelp]({activity['url']})")
+
 
 # Main application
 def main():
@@ -743,9 +803,9 @@ def main():
                     if activity_type in ["Restaurant", "Coffee & Drinks", "Bar", "Hotel / Stay"]:
                         activities = fetch_yelp_activities(latitude, longitude, activity_type, radius_meters)
                     elif activity_type == "Hiking":
-                        activities = fetch_hiking_routes(latitude, longitude, radius_meters)
+                            activities = fetch_hiking_routes(latitude, longitude, radius)
                     elif activity_type == "Cycling":
-                        activities = fetch_cycling_routes(latitude, longitude, radius_meters)
+                        activities = fetch_cycling_routes(latitude, longitude, radius)
                     
                     if activities:
                         st.session_state.current_activities = activities
@@ -784,3 +844,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
